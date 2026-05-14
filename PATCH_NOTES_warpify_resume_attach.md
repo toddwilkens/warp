@@ -123,3 +123,135 @@ Warp's `Oz for OSS` framing suggests they're receptive to ecosystem contribution
 - **Telemetry**: Warp has `TelemetryEvent::ReceivedSubshellRcFileDcs` at `view.rs:11743`. The new path needs its own telemetry event for upstream observability — Warp will want this in the PR.
 - **`block_list.is_bootstrapped()` precondition**: this assumes the local Mac tab has already finished its own zsh bootstrap before `claude-session` runs. The launch-config flow guarantees this (`commands.exec` runs in interactive shell). If a future launch path bypasses the local shell, the fast path would silently no-op — log a clear warning so it's diagnosable.
 - **Encoded vs unencoded DCS**: choose hex-encoded (default). `SourcedRcFileForWarp` is special-cased unencoded because the original RC file snippet is human-readable; we don't need that property here.
+
+## Phase B recon notes (pre-build, line numbers from warp@0d5da4d2)
+
+Captured during the cold-build wait so the next iteration goes straight to editing.
+
+### Sites 1–3 (LANDED on this branch, commit `4845677`)
+
+Mechanical scaffolding committed; compiles standalone as observable no-op.
+
+### Site 4 — `app/src/terminal/model/terminal_model.rs`
+
+**Model: `sourced_rc_file()` at `:2988–3013`** — closest analog. Pattern to mirror:
+
+```rust
+fn sourced_rc_file(&mut self, data: SourcedRcFileForWarpValue) {
+    if self.block_list.is_bootstrapped() {
+        self.did_receive_rc_file_dcs = Some(true);     // <-- WE SKIP THIS
+        let shell_type = ShellType::from_name(data.shell.as_str());
+        match shell_type {
+            Some(shell_type) => self.event_proxy.send_terminal_event(
+                Event::SourcedRcFileInSubshell(SourcedRcFileInSubshellEvent { ... })
+            ),
+            None => log::error!(...),
+        }
+    }
+}
+```
+
+Our `resume_warpify_session()` should:
+
+- Add `if !self.ignore_bootstrapping_messages { ... }` outer guard (mirrors `init_shell` at `:2906–2907`; `sourced_rc_file` actually omits this guard — TBD whether to follow `init_shell` strict pattern or `sourced_rc_file` permissive pattern).
+- Gate on `self.block_list.is_bootstrapped()` (line `:2991` pattern).
+- Do **NOT** touch `self.did_receive_rc_file_dcs` (design intent: this is a fast path, not an RC-file path).
+- Map `data.shell` → `ShellType` via `ShellType::from_name`.
+- On success, emit `Event::ResumeWarpifySession(ResumeWarpifySessionEvent { shell_type, uname, session_id })` via `self.event_proxy.send_terminal_event(...)`.
+- On unknown shell, `log::error!` (same shape as `:3005–3010`).
+- On `!is_bootstrapped()`, `log::warn!` and ignore (design doc §4).
+
+Other relevant landmarks confirmed:
+
+- `terminal_model.rs:519` — `ignore_bootstrapping_messages: bool` field decl.
+- `:554` — `did_receive_rc_file_dcs: Option<bool>` field decl.
+- `:1505–1507` — `pub fn ignore_bootstrapping_messages(&mut self)` setter.
+- `:1605, :1621` — existing `block_list().is_bootstrapped()` / `active_block().is_bootstrapped()` callers.
+- `:2821` — `ignore_bootstrapping_messages = false` reset.
+
+### Site 4b — `app/src/terminal/event.rs` (and `model_events.rs`)
+
+Two parallel `Event` enums need the new variant. Both follow the same pattern as `SourcedRcFileInSubshell`.
+
+**`app/src/terminal/event.rs:30` (outer Event enum):**
+
+- Add `ResumeWarpifySession(ResumeWarpifySessionEvent)` near `:94` (next to `SourcedRcFileInSubshell`).
+- Add new struct `ResumeWarpifySessionEvent` near `:161` (next to `SourcedRcFileInSubshellEvent`):
+
+```rust
+#[derive(Debug, Clone)]
+pub struct ResumeWarpifySessionEvent {
+    pub shell_type: ShellType,
+    pub uname: Option<String>,
+    pub session_id: Option<String>,
+}
+```
+
+**`app/src/terminal/model_events.rs:6,444` (ModelEvent enum):**
+
+- Add `SourcedRcFileInSubshellEvent`-style import on line `:6` (already imports it — add `ResumeWarpifySessionEvent` to the same import line, OR add a new `pub use` if the existing import is glob).
+- Add `ResumeWarpifySession(ResumeWarpifySessionEvent)` variant near `:444`.
+
+Note the existing pattern: `event.rs::Event` is what the model emits via `event_proxy.send_terminal_event(...)`. The bridge between `Event` and `ModelEvent` is somewhere in the model→view event pump (not yet located — Phase B will surface it if the variant is missing on either side; the compiler will tell us).
+
+### Site 5 — `app/src/terminal/view.rs`
+
+**Model: `ModelEvent::SourcedRcFileInSubshell` arm at `:11742–11783`** — adjacent to our patch site.
+
+What that arm does (the path we are NOT taking):
+1. Fires `TelemetryEvent::ReceivedSubshellRcFileDcs`.
+2. Spawns a delayed task that waits `TRIGGER_RC_FILE_SUBSHELL_BOOTSTRAP_DELAY`.
+3. After the delay, checks `is_ssh`, `tmux_control_mode_active`, `has_ai_metadata`, returns early on agent / tmux.
+4. Calls either `continue_warpify_ssh_session(&uname, shell_type, ctx)` (the SSH path) OR `trigger_subshell_bootstrap(Some(shell_type), true, ctx)` (the local subshell path).
+
+`continue_warpify_ssh_session()` is at `:24317` — it's the function that actually lights up warpify state for an SSH session WITHOUT injecting a subshell bootstrap. **This is probably the function we want to call from the new arm**, NOT `trigger_subshell_bootstrap` (which calls `start_bootstrap_timer` + writes init bytes to the pty — the failure mode).
+
+Proposed new arm shape (subject to empirical refinement):
+
+```rust
+ModelEvent::ResumeWarpifySession(event) => {
+    send_telemetry_from_ctx!(TelemetryEvent::ResumeWarpifySession, ctx);
+    let shell_type = event.shell_type;
+    let uname = event.uname.clone().unwrap_or_default();
+    // Same agent / tmux guards as the SourcedRcFileInSubshell arm.
+    let (is_ssh, is_tmux_control_mode_active, has_ai_metadata) = { ... };
+    if has_ai_metadata { return; }
+    if is_tmux_control_mode_active { return; }
+    if is_ssh {
+        self.continue_warpify_ssh_session(&uname, shell_type, ctx);
+    } else {
+        // Local-only resumed sessions are out of scope for #560 — log + ignore.
+        log::warn!("ResumeWarpifySession on non-SSH block; ignoring");
+    }
+}
+```
+
+Key differences from `SourcedRcFileInSubshell` arm:
+- **No spawn delay.** The SourcedRcFileInSubshell delay exists to coalesce with the RC-file flow; we have nothing to coalesce with.
+- **No `trigger_subshell_bootstrap` branch.** That's the byte-interleave + watchdog culprit for our case.
+- **`is_ssh` is the expected case** (claude-session always runs over ssh). Non-SSH is logged + ignored.
+
+Empirical questions for Phase B:
+- Does `continue_warpify_ssh_session` alone fully light up the warpify UI (command corrections, file tree, AI hints, OSC52 clipboard), or are there state fields it doesn't touch that the SourcedRcFileInSubshell→trigger_subshell_bootstrap path does?
+- If yes, follow up by reading `continue_warpify_ssh_session` body at `:24317` and `trigger_subshell_bootstrap` body at `:8549` and diff'ing the state mutations.
+
+### Site 6 — Telemetry parity (`app/src/server/telemetry/events.rs`)
+
+`TelemetryEvent::ReceivedSubshellRcFileDcs` is a unit variant — 5 mechanical sites:
+
+| Line  | What                                                                                  |
+| ----- | ------------------------------------------------------------------------------------- |
+| `:1683` | variant decl (`ReceivedSubshellRcFileDcs,`)                                       |
+| `:4133` | big match arm (likely category bucketing)                                          |
+| `:4863` | big match arm (likely a second bucketing pass)                                     |
+| `:5436` | `EnablementState::Always` arm                                                       |
+| `:5920` | display-name arm (`"Received Subshell RC File DCS"`)                              |
+| `:6623` | description arm (`"Spawned a subshell to be automatically Warpified"`)             |
+
+Add `TelemetryEvent::ResumeWarpifySession` as a sibling unit variant + 5 parallel arms with display name `"Resumed Warpify Session"` and description `"Marked a tab warpified via fast-path on attach to an already-bootstrapped backing shell"`.
+
+### Test sites (for the eventual upstream PR)
+
+- `app/src/terminal/model/ansi/mod_tests.rs` — JSON round-trip for `ResumeWarpifySession` (mirror existing hook round-trip tests).
+- Mock handler — already covered by the default no-op landed in `:296`.
+- Integration test in `crates/integration/` — exercise the fast path on a tab whose local `block_list` is already bootstrapped.
