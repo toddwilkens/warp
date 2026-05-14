@@ -82,6 +82,15 @@ pub(super) enum DProtoHook {
     ExitShell {
         value: ExitShellValue,
     },
+    /// Emitted by clients that are attaching a new Warp tab to a shell session that has
+    /// already been warpified out-of-band (e.g. `dtach -A` to a pre-existing socket where
+    /// the inner shell was bootstrapped by an earlier tab). Tells Warp to mark this tab's
+    /// warpify UI active using inferred/minimal session info, WITHOUT injecting a
+    /// re-bootstrap script into the (shared, already-running) inner shell and WITHOUT
+    /// starting the bootstrap failure watchdog. See isidore-infra#560.
+    ResumeWarpifySession {
+        value: ResumeWarpifySessionValue,
+    },
 }
 
 impl DProtoHook {
@@ -106,6 +115,7 @@ impl DProtoHook {
             DProtoHook::SshTmuxInstaller { .. } => "SshTmuxInstaller",
             DProtoHook::TmuxInstallFailed { .. } => "TmuxInstallFailed",
             DProtoHook::ExitShell { .. } => "ExitShell",
+            DProtoHook::ResumeWarpifySession { .. } => "ResumeWarpifySession",
         }
     }
 
@@ -159,6 +169,9 @@ impl DProtoHook {
                 value: Default::default(),
             }),
             "ExitShell" => Some(DProtoHook::ExitShell {
+                value: Default::default(),
+            }),
+            "ResumeWarpifySession" => Some(DProtoHook::ResumeWarpifySession {
                 value: Default::default(),
             }),
             _ => {
@@ -694,6 +707,27 @@ pub struct FinishUpdateValue {
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ExitShellValue {
     pub session_id: SessionId,
+}
+
+/// Payload for the `ResumeWarpifySession` DCS hook. Minimal by design: the caller
+/// (e.g. a `dtach -A` wrapper) cannot know the full `BootstrappedValue` field set
+/// for an already-running inner shell, and we don't want it to fake them. The
+/// view-side handler treats unset fields as "unknown — use safe defaults".
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ResumeWarpifySessionValue {
+    /// The shell running inside the resumed session ("zsh", "bash", "fish").
+    pub shell: String,
+
+    /// Remote `uname -s` value (e.g. "Linux", "Darwin"), used by warpify's
+    /// command-correction heuristics. Optional — fast path falls back to
+    /// generic defaults when absent.
+    #[serde(deserialize_with = "empty_string_is_none", default)]
+    pub uname: Option<String>,
+
+    /// Optional client-supplied identifier for log / telemetry correlation
+    /// across the N tabs sharing the same backing shell.
+    #[serde(deserialize_with = "empty_string_is_none", default)]
+    pub session_id: Option<String>,
 }
 
 /// Custom serde deserializer that trims trailing null bytes.

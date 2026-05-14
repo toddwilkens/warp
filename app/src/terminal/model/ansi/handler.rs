@@ -288,6 +288,13 @@ pub trait Handler {
     /// Otherwise, it's ignored.
     fn sourced_rc_file(&mut self, _data: SourcedRcFileForWarpValue) {}
 
+    /// Callback emitted by clients attaching a new tab to an already-warpified backing
+    /// shell (e.g. `dtach -A` to a pre-existing socket). Implementations should mark
+    /// the tab's warpify UI active using inferred/minimal session info WITHOUT injecting
+    /// a re-bootstrap script into the shared inner shell. The default no-op is correct
+    /// for any handler that doesn't model warpify UI state. See isidore-infra#560.
+    fn resume_warpify_session(&mut self, _data: ResumeWarpifySessionValue) {}
+
     /// Callback emitted during the initialization process for ssh sessions
     fn init_ssh(&mut self, _data: InitSshValue) {}
 
