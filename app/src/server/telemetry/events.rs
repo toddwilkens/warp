@@ -1681,6 +1681,12 @@ pub enum TelemetryEvent {
     AddAddedSubshellCommand,
     RemoveAddedSubshellCommand,
     ReceivedSubshellRcFileDcs,
+    /// Emitted when a Warp tab receives the `ResumeWarpifySession` DCS hook
+    /// from a client attaching to an already-warpified backing shell
+    /// (e.g. `dtach -A` to a pre-existing socket). Marks parity with
+    /// `ReceivedSubshellRcFileDcs` for the fast-path resume flow.
+    /// See isidore-infra#560.
+    ResumeWarpifySession,
     AddDenylistedSshTmuxWrapperHost,
     RemoveDenylistedSshTmuxWrapperHost,
     /// User Setting for enabling SSH Tmux Wrapper changed.
@@ -4131,6 +4137,7 @@ impl TelemetryEvent {
             | TelemetryEvent::AddAddedSubshellCommand
             | TelemetryEvent::RemoveAddedSubshellCommand
             | TelemetryEvent::ReceivedSubshellRcFileDcs
+            | TelemetryEvent::ResumeWarpifySession
             | TelemetryEvent::AddDenylistedSshTmuxWrapperHost
             | TelemetryEvent::RemoveDenylistedSshTmuxWrapperHost
             | TelemetryEvent::SshTmuxWarpifyBlockAccepted
@@ -4861,6 +4868,7 @@ impl TelemetryEvent {
             | TelemetryEvent::AddAddedSubshellCommand
             | TelemetryEvent::RemoveAddedSubshellCommand
             | TelemetryEvent::ReceivedSubshellRcFileDcs
+            | TelemetryEvent::ResumeWarpifySession
             | TelemetryEvent::AddDenylistedSshTmuxWrapperHost
             | TelemetryEvent::RemoveDenylistedSshTmuxWrapperHost
             | TelemetryEvent::ToggleSshTmuxWrapper { .. }
@@ -5434,6 +5442,7 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::AddAddedSubshellCommand => EnablementState::Always,
             Self::RemoveAddedSubshellCommand => EnablementState::Always,
             Self::ReceivedSubshellRcFileDcs => EnablementState::Always,
+            Self::ResumeWarpifySession => EnablementState::Always,
             Self::ShowAliasExpansionBanner => EnablementState::Always,
             Self::EnableAliasExpansionFromBanner => EnablementState::Always,
             Self::DismissAliasExpansionBanner => EnablementState::Always,
@@ -5918,6 +5927,7 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
             Self::AddAddedSubshellCommand => "Add Added Subshell Command",
             Self::RemoveAddedSubshellCommand => "Remove Added Subshell Command",
             Self::ReceivedSubshellRcFileDcs => "Received Subshell RC File DCS",
+            Self::ResumeWarpifySession => "Resume Warpify Session",
             Self::ToggleSshTmuxWrapper => "Toggle SSH Tmux Wrapper",
             Self::ToggleSshWarpification => "Toggle SSH Warpification",
             Self::SetSshExtensionInstallMode => "Set SSH Extension Install Mode",
@@ -6621,6 +6631,9 @@ impl TelemetryEventDesc for TelemetryEventDiscriminants {
                 "Removed a command from the list of commands to automatically Warpify via Warp's subshell wrapper"
             }
             Self::ReceivedSubshellRcFileDcs => "Spawned a subshell to be automatically Warpified",
+            Self::ResumeWarpifySession => {
+                "Marked a tab Warpified via fast-path on attach to an already-bootstrapped backing shell"
+            }
             Self::ToggleSshTmuxWrapper => {
                 "Changed the setting for SSH sessions to prompt for Tmux Wrapper"
             }
