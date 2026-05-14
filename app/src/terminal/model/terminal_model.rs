@@ -4,7 +4,7 @@ use crate::terminal::available_shells::AvailableShell;
 use crate::terminal::block_list_element::GridType;
 use crate::terminal::event::{
     BootstrappedEvent, Event, ExecutedExecutorCommandEvent, InitSshEvent, InitSubshellEvent,
-    SourcedRcFileInSubshellEvent, SshLoginStatus, TerminalMode,
+    ResumeWarpifySessionEvent, SourcedRcFileInSubshellEvent, SshLoginStatus, TerminalMode,
 };
 use crate::terminal::event_listener::ChannelEventListener;
 use crate::terminal::model::ansi;
@@ -53,8 +53,8 @@ use super::{
 use super::{tmux, Secret, SecretHandle};
 use crate::terminal::model::ansi::{
     ClearValue, CommandFinishedValue, ExitShellValue, InitShellValue, InitSshValue,
-    InitSubshellValue, PreInteractiveSSHSessionValue, PrecmdValue, PreexecValue, SSHValue,
-    SourcedRcFileForWarpValue,
+    InitSubshellValue, PreInteractiveSSHSessionValue, PrecmdValue, PreexecValue,
+    ResumeWarpifySessionValue, SSHValue, SourcedRcFileForWarpValue,
 };
 use crate::terminal::model::grid::IndexRegion;
 use crate::terminal::model::session::SessionInfo;
@@ -3008,6 +3008,49 @@ impl ansi::Handler for TerminalModel {
                         data.shell
                     );
                 }
+            }
+        }
+    }
+
+    fn resume_warpify_session(&mut self, data: ResumeWarpifySessionValue) {
+        // Fast path for tabs attaching to an already-warpified backing shell
+        // (e.g. `dtach -A` to a pre-existing socket). Caller has an out-of-band
+        // guarantee the shared inner shell is already bootstrapped, so we
+        // activate warpify UI for this tab WITHOUT injecting a re-bootstrap
+        // script into the inner shell. See isidore-infra#560.
+        //
+        // Diverges from `sourced_rc_file` in two ways:
+        //   1. Does NOT touch `did_receive_rc_file_dcs` — there is no RC-file
+        //      flow to coalesce with on the resume path.
+        //   2. Mirrors `init_shell`'s `ignore_bootstrapping_messages` guard so
+        //      shutdown/exit paths cannot accidentally re-warpify a dying tab.
+        if self.ignore_bootstrapping_messages {
+            return;
+        }
+        if !self.block_list.is_bootstrapped() {
+            log::warn!(
+                "Received ResumeWarpifySession DCS on a tab whose block_list is not yet \
+                 bootstrapped; ignoring. The caller (e.g. claude-session) emits this hook \
+                 only on attach to a pre-existing dtach socket, which implies the local \
+                 Mac shell has already finished its Warp launch-config bootstrap. If you \
+                 see this in the wild, check the launch-config path."
+            );
+            return;
+        }
+        let shell_type = ShellType::from_name(data.shell.as_str());
+        match shell_type {
+            Some(shell_type) => self.event_proxy.send_terminal_event(
+                Event::ResumeWarpifySession(ResumeWarpifySessionEvent {
+                    shell_type,
+                    uname: data.uname,
+                    session_id: data.session_id,
+                }),
+            ),
+            None => {
+                log::error!(
+                    "Received invalid shell name in ResumeWarpifySessionValue: {}",
+                    data.shell
+                );
             }
         }
     }
