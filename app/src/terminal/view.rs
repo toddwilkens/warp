@@ -11792,22 +11792,59 @@ impl TerminalView {
                 // flag — enough for Tab B to render input blocks against the
                 // shared inner shell. See #560 comment 4460861562.
                 send_telemetry_from_ctx!(TelemetryEvent::ResumeWarpifySession, ctx);
-                let (is_tmux_control_mode_active, has_ai_metadata) = {
+                let (is_tmux_control_mode_active, has_ai_metadata, pending_cm, active_block_idx) = {
                     let lock = self.model.lock();
                     let has_ai_metadata = lock
                         .block_list()
                         .active_block()
                         .agent_interaction_metadata()
                         .is_some();
-                    (lock.tmux_control_mode_active(), has_ai_metadata)
+                    (
+                        lock.tmux_control_mode_active(),
+                        has_ai_metadata,
+                        lock.is_pending_warp_initiated_control_mode(),
+                        lock.block_list().active_block_index(),
+                    )
                 };
+                // #569 diagnostic: dump model state on entry so we can see
+                // which fields the resume arm needs to flip to mirror Tab A.
+                log::warn!(
+                    "[#569 diag] ResumeWarpifySession entry: \
+                     shell_type={:?} uname={:?} \
+                     is_login_shell_bootstrapped={} \
+                     pending_warp_initiated_control_mode={} \
+                     tmux_control_mode_active={} has_ai_metadata={} \
+                     active_block_index={:?} \
+                     warpify_shell_type={:?}",
+                    event.shell_type,
+                    event.uname,
+                    self.is_login_shell_bootstrapped,
+                    pending_cm,
+                    is_tmux_control_mode_active,
+                    has_ai_metadata,
+                    active_block_idx,
+                    self.warpify_state.get_shell_type(),
+                );
                 if has_ai_metadata || is_tmux_control_mode_active {
+                    log::warn!(
+                        "[#569 diag] ResumeWarpifySession: guard rejected \
+                         (ai_metadata={} tmux_cm={}) — returning",
+                        has_ai_metadata,
+                        is_tmux_control_mode_active
+                    );
                     return;
                 }
                 self.warpify_state.set_shell_type(&event.shell_type);
                 self.model
                     .lock()
                     .set_pending_warp_initiated_control_mode();
+                log::warn!(
+                    "[#569 diag] ResumeWarpifySession exit: \
+                     warpify_shell_type={:?} \
+                     pending_warp_initiated_control_mode={}",
+                    self.warpify_state.get_shell_type(),
+                    self.model.lock().is_pending_warp_initiated_control_mode(),
+                );
             }
             ModelEvent::PromptUpdated => {
                 self.input.update(ctx, |input, ctx| {
