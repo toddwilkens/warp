@@ -82,7 +82,6 @@ use std::ops::{Range, RangeInclusive};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use warp_core::features::FeatureFlag;
 use warp_core::semantic_selection::SemanticSelection;
 pub use warp_terminal::model::BlockIndex;
@@ -513,6 +512,17 @@ pub struct TerminalModel {
     /// This is used to construct a final, populated `SessionInfo` after the session is
     /// bootstrapped.
     pending_session_info: Option<SessionInfo>,
+
+    /// #569: set by `resume_warpify_session` when a tab attaches to an
+    /// already-warpified backing shell via `dtach -A` (no fresh bootstrap
+    /// from the inner shell). Holds `(shell_name, uname)` until the first
+    /// `Precmd` arrives with a session_id, at which point `precmd` calls
+    /// `init_shell` + `bootstrapped` using that real id and clears this
+    /// field. Deferred-bootstrap-on-first-precmd avoids registering a
+    /// `Session` with a fabricated id that downstream `Precmd` lookups
+    /// (LineEditorStatus, completer, chips, AI input model, in-band exec)
+    /// would fail.
+    pending_resume_warpify: Option<(String, String)>,
 
     /// If true, the terminal was bootstrapping but received a ^D from the user. We cannot stop the
     /// shell from sending us bootstrapping messages, but we can ignore them. This value is always
@@ -1142,6 +1152,7 @@ impl TerminalModel {
             pending_shell_launch_data: None,
             active_shell_launch_data: None,
             pending_session_info: None,
+            pending_resume_warpify: None,
             ignore_bootstrapping_messages: false,
             session_startup_path,
             is_receiving_in_band_command_output: IsReceivingInBandCommandOutput::No,
@@ -2826,6 +2837,39 @@ impl ansi::Handler for TerminalModel {
             env_vars.insert("KUBECONFIG".to_string(), kube_config);
         }
         let handled_after_inband = data.was_sent_after_in_band_command();
+
+        // #569 v5.1 (Approach C): complete the deferred resume-warpify
+        // bootstrap now that we have the inner shell's real session_id.
+        // Sequence: init_shell → bootstrapped → THEN continue with normal
+        // precmd flow so the `Precmd` HandlerEvent emitted below sees a
+        // registered Session.
+        if let (Some((shell_name, uname)), Some(real_session_id)) =
+            (self.pending_resume_warpify.take(), session_id)
+        {
+            log::info!(
+                "[#569] Precmd: completing deferred resume-warpify bootstrap \
+                 with real session_id={}",
+                real_session_id,
+            );
+            self.init_shell(InitShellValue {
+                session_id: real_session_id.into(),
+                shell: shell_name.clone(),
+                is_subshell: true,
+                user: String::new(),
+                // Empty hostname forces `determine_session_type` →
+                // `WarpifiedRemote` (the local-hostname compare in
+                // session.rs:675 fails), which is the correct
+                // classification: we're warpifying a remote inner shell.
+                hostname: String::new(),
+                wsl_name: None,
+            });
+            self.bootstrapped(BootstrappedValue {
+                shell: shell_name,
+                os_category: Some(uname),
+                ..Default::default()
+            });
+        }
+
         delegate!(self.precmd(data));
 
         self.emit_handler_event(HandlerEvent::Precmd {
@@ -3059,40 +3103,27 @@ impl ansi::Handler for TerminalModel {
             return;
         }
 
-        // Per-tab session_id with nanosecond entropy. The remote shell's real
-        // session_id is owned by Tab A's view of the subshell; Tab B builds
-        // an independent client-side session over the same backing PTY chain
-        // (autossh → ssh → dtach → shared inner zsh). Nanos avoid collision
-        // with Tab B's local Mac-shell SessionId (which is a `date +%s$RANDOM`
-        // value emitted by `WARP_SESSION_ID`).
-        let synthetic_session_id: u64 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or_default();
+        // #569 v5.1 (Approach C): defer bootstrap synthesis until the first
+        // `Precmd` arrives carrying the inner shell's real session_id.
+        // Registering a Session with a synthetic id (v5 attempt) caused
+        // every downstream consumer keyed on `active_session_id` to fail
+        // its `sessions.get(...)` lookup because the inner shell's
+        // subsequent Precmd payloads carry its OWN session_id, not ours.
+        // By deferring, we register the Session with the same id that
+        // `ModelEventDispatcher::active_session_id` is about to be set to.
         let uname = data.uname.unwrap_or_default();
         let shell_name = data.shell;
-
-        self.init_shell(InitShellValue {
-            session_id: synthetic_session_id.into(),
-            shell: shell_name.clone(),
-            is_subshell: true,
-            user: String::new(),
-            // Empty hostname forces `determine_session_type` → `WarpifiedRemote`
-            // (the local-hostname compare in session.rs:675 fails), which is
-            // the correct classification: we're warpifying a remote inner shell.
-            hostname: String::new(),
-            wsl_name: None,
-        });
-        self.bootstrapped(BootstrappedValue {
-            shell: shell_name,
-            os_category: Some(uname),
-            ..Default::default()
-        });
+        log::info!(
+            "[#569] ResumeWarpifySession: deferring init_shell+bootstrapped \
+             until first Precmd (will register Session with the inner shell's \
+             reported session_id). data.session_id hint={:?}",
+            data.session_id
+        );
+        self.pending_resume_warpify = Some((shell_name, uname));
 
         // Telemetry marker for the resume fast-path. `BootstrappingSucceeded`
-        // also fires from `Sessions::initialize_bootstrapped_session` and
-        // covers the underlying bootstrap dimensions; this marker is
-        // specifically "we took the no-PTY-write resume path".
+        // also fires from `Sessions::initialize_bootstrapped_session` after
+        // the deferred bootstrap completes.
         self.event_proxy
             .send_terminal_event(Event::ResumeWarpifySession);
     }
