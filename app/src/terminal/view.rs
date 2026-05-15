@@ -11791,6 +11791,11 @@ impl TerminalView {
                 send_telemetry_from_ctx!(TelemetryEvent::ResumeWarpifySession, ctx);
                 let shell_type = event.shell_type;
                 let uname = event.uname.clone().unwrap_or_default();
+                log::info!(
+                    "ResumeWarpifySession arm entered: shell_type={:?} uname={:?}",
+                    shell_type,
+                    uname
+                );
                 let (is_ssh, is_tmux_control_mode_active, has_ai_metadata) = {
                     let lock = self.model.lock();
                     let has_ai_metadata = lock
@@ -11804,11 +11809,26 @@ impl TerminalView {
                         has_ai_metadata,
                     )
                 };
+                log::info!(
+                    "ResumeWarpifySession guards: is_ssh={} tmux_control_mode_active={} has_ai_metadata={}",
+                    is_ssh,
+                    is_tmux_control_mode_active,
+                    has_ai_metadata
+                );
                 if has_ai_metadata || is_tmux_control_mode_active {
+                    log::info!(
+                        "ResumeWarpifySession early-return: ai_metadata={} tmux={}",
+                        has_ai_metadata,
+                        is_tmux_control_mode_active
+                    );
                     return;
                 }
                 if is_ssh {
+                    log::info!("ResumeWarpifySession: calling continue_warpify_ssh_session");
                     self.continue_warpify_ssh_session(&uname, shell_type, ctx);
+                    log::info!("ResumeWarpifySession: continue_warpify_ssh_session returned");
+                } else {
+                    log::info!("ResumeWarpifySession: is_ssh=false, no-op");
                 }
             }
             ModelEvent::PromptUpdated => {
