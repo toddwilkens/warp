@@ -264,6 +264,17 @@ impl WarpifyState {
         pending_state.ssh_warpify_timeout_handle = Some(spawned_future_handle);
     }
 
+    /// Mark this tab as a passive observer of an already-warpified shared
+    /// session (dtach attach, #569). Sets only view-local fields — no
+    /// `SessionManager` registration, no PTY write, no
+    /// `HandlerEvent::Bootstrapped` emission. The caller is responsible for
+    /// the model's `set_pending_warp_initiated_control_mode` flag and any
+    /// view-side follow-ups (subshell separator, prompt refresh, pane title).
+    pub fn mark_resumed(&mut self, shell_type: &ShellType) {
+        self.set_shell_type(shell_type);
+        self.abort_ssh_warpify_timeout();
+    }
+
     pub fn abort_ssh_warpify_timeout(&mut self) {
         self.replace_timeout_id();
         if let Some(handle) = self

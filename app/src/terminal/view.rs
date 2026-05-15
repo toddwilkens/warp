@@ -488,7 +488,7 @@ use crate::terminal::model::selection::{SelectAction, SelectionDirection};
 use crate::terminal::model::session::{BootstrapSessionType, SessionType, Sessions, SessionsEvent};
 use crate::terminal::model::terminal_model::{BlockIndex, TerminalInputState};
 use crate::terminal::model::terminal_model::{
-    BlockSelectionCardinality, SelectedBlocks, WithinModel,
+    BlockSelectionCardinality, SelectedBlocks, SubshellInitializationInfo, WithinModel,
 };
 use crate::terminal::model::{
     ansi::{ClearMode, Handler},
@@ -11834,16 +11834,45 @@ impl TerminalView {
                     );
                     return;
                 }
-                self.warpify_state.set_shell_type(&event.shell_type);
+
+                // #569 Approach B: build view-side equivalent of
+                // handle_session_bootstrapped's warpify subset, without any
+                // SessionManager registration, PTY write, or bootstrap
+                // lifecycle emission.
+                self.warpify_state.mark_resumed(&event.shell_type);
                 self.model
                     .lock()
                     .set_pending_warp_initiated_control_mode();
+
+                // Synthesize the subshell-info that handle_session_bootstrapped
+                // would have read from the bootstrap event. add_subshell_separator
+                // only reads spawning_command (the head token) to label the
+                // separator block.
+                let subshell_info = SubshellInitializationInfo {
+                    spawning_command: event.shell_type.name().to_string(),
+                    was_triggered_by_rc_file_snippet: true,
+                    env_var_collection_name: None,
+                    ssh_connection_info: None,
+                };
+                self.warpify_state.add_subshell_separator(
+                    &subshell_info,
+                    self.model.clone(),
+                    ctx,
+                );
+
+                self.is_login_shell_bootstrapped = true;
+                self.refresh_warp_prompt(ctx);
+                self.update_pane_configuration(ctx);
+
                 log::warn!(
-                    "[#569 diag] ResumeWarpifySession exit: \
+                    "[#569 diag] ResumeWarpifySession exit (v4.1): \
                      warpify_shell_type={:?} \
-                     pending_warp_initiated_control_mode={}",
+                     pending_warp_initiated_control_mode={} \
+                     is_login_shell_bootstrapped={} \
+                     subshell_separator_added=true",
                     self.warpify_state.get_shell_type(),
                     self.model.lock().is_pending_warp_initiated_control_mode(),
+                    self.is_login_shell_bootstrapped,
                 );
             }
             ModelEvent::PromptUpdated => {
