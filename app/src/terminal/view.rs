@@ -11835,14 +11835,19 @@ impl TerminalView {
                     return;
                 }
 
-                // #569 Approach B: build view-side equivalent of
+                // #569 Approach B v4.2: build view-side equivalent of
                 // handle_session_bootstrapped's warpify subset, without any
                 // SessionManager registration, PTY write, or bootstrap
                 // lifecycle emission.
+                //
+                // v4.2: DROPPED `set_pending_warp_initiated_control_mode()`.
+                // That flag transitions the model into "expecting tmux-CC
+                // bootstrap completion". Tab A really enters tmux-CC after
+                // its PTY-written warpify script runs; Tab B never will
+                // (no PTY write, no handshake). Leaving the flag set
+                // strands the model in a pending tmux-CC state and locks
+                // input after the first command (empirical, v4.1 test).
                 self.warpify_state.mark_resumed(&event.shell_type);
-                self.model
-                    .lock()
-                    .set_pending_warp_initiated_control_mode();
 
                 // Synthesize the subshell-info that handle_session_bootstrapped
                 // would have read from the bootstrap event. add_subshell_separator
@@ -11865,7 +11870,7 @@ impl TerminalView {
                 self.update_pane_configuration(ctx);
 
                 log::warn!(
-                    "[#569 diag] ResumeWarpifySession exit (v4.1): \
+                    "[#569 diag] ResumeWarpifySession exit (v4.2): \
                      warpify_shell_type={:?} \
                      pending_warp_initiated_control_mode={} \
                      is_login_shell_bootstrapped={} \
