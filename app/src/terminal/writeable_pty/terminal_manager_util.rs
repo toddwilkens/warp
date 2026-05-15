@@ -84,21 +84,43 @@ pub fn wire_up_pty_controller_with_view<T: EventLoopSender>(
                 });
             }
             view::Event::ExecuteCommand(event) => {
-                let Some(shell_type) = sessions
+                // #569 v4.3 (Option 2): resumed/dtach-attached tabs (Tab B)
+                // have no `Session` registered, so the normal lookup fails
+                // and the command is silently dropped. Fall back to the
+                // shell type stamped by the view from its `WarpifyState`.
+                // History updates and workflow state still depend on the
+                // session being present, so skip them on the fallback path.
+                let session_shell_type = sessions
                     .as_ref(ctx)
                     .get(event.session_id)
-                    .map(|s| s.shell().shell_type())
-                else {
-                    log::warn!("Failed to get shell type for the session associated to the command execution event.");
-                    return;
+                    .map(|s| s.shell().shell_type());
+                let shell_type = match (session_shell_type, event.fallback_shell_type) {
+                    (Some(t), _) => t,
+                    (None, Some(t)) => {
+                        log::warn!(
+                            "[#569 probe] ExecuteCommand: session lookup \
+                             missing for session_id={:?}; using stamped \
+                             fallback shell_type={:?}",
+                            event.session_id,
+                            t,
+                        );
+                        t
+                    }
+                    (None, None) => {
+                        log::warn!("Failed to get shell type for the session associated to the command execution event.");
+                        return;
+                    }
                 };
 
-                model_clone.lock().block_list_mut().active_block_mut().set_cloud_workflow_state(event.workflow_id);
+                let session_present = sessions.as_ref(ctx).get(event.session_id).is_some();
+                if session_present {
+                    model_clone.lock().block_list_mut().active_block_mut().set_cloud_workflow_state(event.workflow_id);
+                }
                 controller.update(ctx, |controller, ctx| {
                     controller.write_command(&event.command, shell_type, event.source.clone(), ctx)
                 });
 
-                if event.should_add_command_to_history {
+                if session_present && event.should_add_command_to_history {
                     update_command_history(
                         event,
                         &model_clone,

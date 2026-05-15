@@ -1656,6 +1656,15 @@ pub struct ExecuteCommandEvent {
     pub should_add_command_to_history: bool,
 
     pub source: CommandExecutionSource,
+
+    /// #569: shell type stashed from the view's [`WarpifyState`] at emission
+    /// time. For resumed/dtach-attached tabs (Tab B) there is no `Session`
+    /// registered with `Sessions`, so `terminal_manager_util.rs`'s
+    /// `sessions.get(session_id)` lookup fails and the command write is
+    /// silently dropped. When `Some`, the handler can fall back to this
+    /// instead of returning, unblocking command submission on the
+    /// observer tab.
+    pub fallback_shell_type: Option<ShellType>,
 }
 
 /// Actions that can be taken on a passive code diff via the input editor.
@@ -6746,6 +6755,7 @@ impl TerminalView {
                     workflow_command: associated_workflow
                         .and_then(|workflow| workflow.model().data.command())
                         .map(str::to_string),
+                    fallback_shell_type: self.warpify_state.get_shell_type(),
                 }));
 
                 if let Some(active_ai_block) = self.active_ai_block(ctx) {
@@ -20294,7 +20304,17 @@ impl TerminalView {
                     self.focus_terminal(ctx);
                 }
 
-                ctx.emit(Event::ExecuteCommand(event.as_ref().clone()));
+                // #569 v4.3 (Option 2): stamp the warpify shell type onto
+                // the event so `terminal_manager_util.rs` can fall back to
+                // it when `sessions.get(session_id)` fails. Resumed tabs
+                // (Tab B) have no registered Session — without this
+                // fallback, every command after the first is silently
+                // dropped at the session-lookup early-return.
+                let mut stamped = event.as_ref().clone();
+                if stamped.fallback_shell_type.is_none() {
+                    stamped.fallback_shell_type = self.warpify_state.get_shell_type();
+                }
+                ctx.emit(Event::ExecuteCommand(stamped));
 
                 if self.block_onboarding_active {
                     self.interrupt_onboarding_blocks(ctx);
@@ -24117,6 +24137,7 @@ impl TerminalView {
                                 should_hide_block: true,
                             },
                         },
+                        fallback_shell_type: me.warpify_state.get_shell_type(),
                     }));
 
                     UpdateManager::handle(ctx).update(ctx, move |update_manager, ctx| {

@@ -14138,6 +14138,9 @@ impl Input {
             workflow_command,
             should_add_command_to_history: true,
             source,
+            // #569 v4.3: filled in by `TerminalView::handle_input_event` at
+            // re-emission time — the view, not the input, owns warpify state.
+            fallback_shell_type: None,
         })));
         end_trace!();
     }
