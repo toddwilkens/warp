@@ -8134,7 +8134,31 @@ impl TerminalView {
         data: B,
         ctx: &mut ViewContext<Self>,
     ) {
-        ctx.emit(Event::WriteBytesToPty { bytes: data.into() });
+        let bytes: Cow<'static, [u8]> = data.into();
+        // [#569 probe] log every PTY write attempt so we can see whether
+        // keystrokes are reaching this entry point after the first block
+        // completes on Tab B (resumed/dtach-attached warpify path).
+        let preview_len = bytes.len().min(16);
+        let preview_hex: String = bytes[..preview_len]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let shared_status = {
+            let lock = self.model.lock();
+            format!("{:?}", lock.shared_session_status())
+        };
+        log::warn!(
+            "[#569 probe] write_to_pty: len={} preview=[{}] \
+             warpify_shell={:?} is_login_shell_bootstrapped={} \
+             shared_session_status={}",
+            bytes.len(),
+            preview_hex,
+            self.warpify_state.get_shell_type(),
+            self.is_login_shell_bootstrapped,
+            shared_status,
+        );
+        ctx.emit(Event::WriteBytesToPty { bytes });
     }
 
     fn write_agent_bytes_to_pty<B: Into<Cow<'static, [u8]>>>(
@@ -10749,6 +10773,27 @@ impl TerminalView {
             ModelEvent::BlockCompleted(block_completed_event) => {
                 record_trace_event!("command_execution:block_completed");
                 end_trace_after_next!("window:redraw:end");
+                // [#569 probe] log block completion arrival so we can
+                // pinpoint the moment Tab B's input freezes (empirical:
+                // freeze happens after the first command completes).
+                {
+                    let lock = self.model.lock();
+                    log::warn!(
+                        "[#569 probe] BlockCompleted: block_type={:?} \
+                         is_login_shell_bootstrapped={} \
+                         active_block_index={:?} \
+                         warpify_shell={:?} \
+                         pending_cm={} tmux_cm_active={} \
+                         shared_session_status={:?}",
+                        block_completed_event.block_type,
+                        self.is_login_shell_bootstrapped,
+                        lock.block_list().active_block_index(),
+                        self.warpify_state.get_shell_type(),
+                        lock.is_pending_warp_initiated_control_mode(),
+                        lock.tmux_control_mode_active(),
+                        lock.shared_session_status(),
+                    );
+                }
                 let block_completed_event_clone = block_completed_event.clone();
                 self.input.update(ctx, |input, ctx| {
                     input.handle_block_completed_event(block_completed_event_clone, ctx);
@@ -11199,12 +11244,25 @@ impl TerminalView {
                 // extra time after the last precmd function is finished.
                 // Additionally, it's possible for hooks to install themselves after the warp
                 // precmd. For example, `fig_precmd` does this.
+                // [#569 probe] log whether the execute_pending_command
+                // gate fires after a block completes. If it doesn't fire,
+                // a queued command from Tab B's input editor never gets
+                // forwarded to the PTY — explaining the input freeze.
                 if self.is_login_shell_bootstrapped {
+                    log::warn!(
+                        "[#569 probe] BlockCompleted: scheduling \
+                         execute_pending_command (bootstrapped=true)"
+                    );
                     let _ = ctx.spawn(
                         async move {
                             warpui::r#async::Timer::after(EXECUTE_PENDING_COMMAND_DELAY).await;
                         },
                         Self::execute_pending_command,
+                    );
+                } else {
+                    log::warn!(
+                        "[#569 probe] BlockCompleted: SKIPPING \
+                         execute_pending_command (bootstrapped=false)"
                     );
                 }
 
@@ -11792,7 +11850,14 @@ impl TerminalView {
                 // flag — enough for Tab B to render input blocks against the
                 // shared inner shell. See #560 comment 4460861562.
                 send_telemetry_from_ctx!(TelemetryEvent::ResumeWarpifySession, ctx);
-                let (is_tmux_control_mode_active, has_ai_metadata, pending_cm, active_block_idx) = {
+                let (
+                    is_tmux_control_mode_active,
+                    has_ai_metadata,
+                    pending_cm,
+                    active_block_idx,
+                    block_count_before,
+                    shared_status_str,
+                ) = {
                     let lock = self.model.lock();
                     let has_ai_metadata = lock
                         .block_list()
@@ -11804,10 +11869,15 @@ impl TerminalView {
                         has_ai_metadata,
                         lock.is_pending_warp_initiated_control_mode(),
                         lock.block_list().active_block_index(),
+                        lock.block_list().blocks().len(),
+                        format!("{:?}", lock.shared_session_status()),
                     )
                 };
                 // #569 diagnostic: dump model state on entry so we can see
                 // which fields the resume arm needs to flip to mirror Tab A.
+                // [#569 probe] also surfaces shared_session_status +
+                // block-list size so we can detect viewer-classification or
+                // unexpected block-tree state on entry.
                 log::warn!(
                     "[#569 diag] ResumeWarpifySession entry: \
                      shell_type={:?} uname={:?} \
@@ -11815,7 +11885,8 @@ impl TerminalView {
                      pending_warp_initiated_control_mode={} \
                      tmux_control_mode_active={} has_ai_metadata={} \
                      active_block_index={:?} \
-                     warpify_shell_type={:?}",
+                     warpify_shell_type={:?} \
+                     block_list_len={} shared_session_status={}",
                     event.shell_type,
                     event.uname,
                     self.is_login_shell_bootstrapped,
@@ -11824,6 +11895,8 @@ impl TerminalView {
                     has_ai_metadata,
                     active_block_idx,
                     self.warpify_state.get_shell_type(),
+                    block_count_before,
+                    shared_status_str,
                 );
                 if has_ai_metadata || is_tmux_control_mode_active {
                     log::warn!(
@@ -11848,6 +11921,10 @@ impl TerminalView {
                 // strands the model in a pending tmux-CC state and locks
                 // input after the first command (empirical, v4.1 test).
                 self.warpify_state.mark_resumed(&event.shell_type);
+                log::warn!(
+                    "[#569 probe] post-mark_resumed: warpify_shell={:?}",
+                    self.warpify_state.get_shell_type(),
+                );
 
                 // Synthesize the subshell-info that handle_session_bootstrapped
                 // would have read from the bootstrap event. add_subshell_separator
@@ -11864,20 +11941,43 @@ impl TerminalView {
                     self.model.clone(),
                     ctx,
                 );
+                {
+                    let lock = self.model.lock();
+                    log::warn!(
+                        "[#569 probe] post-add_subshell_separator: \
+                         block_list_len={} active_block_index={:?}",
+                        lock.block_list().blocks().len(),
+                        lock.block_list().active_block_index(),
+                    );
+                }
 
                 self.is_login_shell_bootstrapped = true;
                 self.refresh_warp_prompt(ctx);
+                log::warn!("[#569 probe] post-refresh_warp_prompt: no-op marker");
                 self.update_pane_configuration(ctx);
+                log::warn!("[#569 probe] post-update_pane_configuration: no-op marker");
+
+                // [#569 probe] capture input editor interaction_state so we
+                // can confirm we're not leaving Tab B's editor disabled —
+                // a disabled editor would silently drop keystrokes after
+                // the first block completes.
+                let editor_state_str = self.input.update(ctx, |input, ctx| {
+                    input.editor().update(ctx, |editor, ctx| {
+                        format!("{:?}", editor.interaction_state(ctx))
+                    })
+                });
 
                 log::warn!(
                     "[#569 diag] ResumeWarpifySession exit (v4.2): \
                      warpify_shell_type={:?} \
                      pending_warp_initiated_control_mode={} \
                      is_login_shell_bootstrapped={} \
-                     subshell_separator_added=true",
+                     subshell_separator_added=true \
+                     input_editor_interaction_state={}",
                     self.warpify_state.get_shell_type(),
                     self.model.lock().is_pending_warp_initiated_control_mode(),
                     self.is_login_shell_bootstrapped,
+                    editor_state_str,
                 );
             }
             ModelEvent::PromptUpdated => {

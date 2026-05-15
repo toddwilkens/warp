@@ -2961,6 +2961,17 @@ impl ansi::Handler for TerminalModel {
 
     fn init_subshell(&mut self, data: InitSubshellValue) {
         let is_tmux_ssh = self.pending_warp_initiated_control_mode.is_some();
+        // [#569 probe] log init_subshell entry so we can detect whether
+        // Tab B's inner shell ever announces itself to the model. If this
+        // fires on Tab B, our resume arm should defer to the real path
+        // instead of synthesizing state.
+        log::warn!(
+            "[#569 probe] init_subshell: shell={:?} uname={:?} \
+             is_tmux_ssh(pending_cm)={}",
+            data.shell,
+            data.uname,
+            is_tmux_ssh,
+        );
         let shell_type = ShellType::from_name(data.shell.as_str());
         if let Some(shell_type) = shell_type {
             self.event_proxy

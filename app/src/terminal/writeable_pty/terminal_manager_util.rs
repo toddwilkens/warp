@@ -54,6 +54,20 @@ pub fn wire_up_pty_controller_with_view<T: EventLoopSender>(
                 });
             }
             view::Event::WriteBytesToPty { bytes } => {
+                // [#569 probe] confirm WriteBytesToPty events are reaching
+                // the controller. If write_to_pty fires (see view.rs probe)
+                // but this never logs, event routing is broken.
+                let preview_len = bytes.len().min(16);
+                let preview_hex: String = bytes[..preview_len]
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                log::warn!(
+                    "[#569 probe] WriteBytesToPty consumed: len={} preview=[{}]",
+                    bytes.len(),
+                    preview_hex,
+                );
                 controller.update(ctx, |controller, ctx| {
                     // TODO: the underlying bytes should be wrapped in an Arc and copied out only when they need to be written to the PTY.
                     controller.write_bytes(bytes.clone(), ctx);
