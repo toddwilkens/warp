@@ -3,8 +3,8 @@ use crate::terminal::model::session::Sessions;
 
 use crate::terminal::event::{
     AfterBlockCompletedEvent, BlockCompletedEvent, BlockMetadataReceivedEvent, Event,
-    ExecutedExecutorCommandEvent, InitSshEvent, InitSubshellEvent, SourcedRcFileInSubshellEvent,
-    TerminalMode,
+    ExecutedExecutorCommandEvent, InitSshEvent, InitSubshellEvent, ResumeWarpifySessionEvent,
+    SourcedRcFileInSubshellEvent, TerminalMode,
 };
 
 use crate::terminal::ClipboardType;
@@ -275,14 +275,8 @@ impl ModelEventDispatcher {
             Event::SourcedRcFileInSubshell(sourced_rc_file_in_subshell_event) => {
                 ModelEvent::SourcedRcFileInSubshell(sourced_rc_file_in_subshell_event)
             }
-            Event::ResumeWarpifySession => {
-                // Telemetry-only event for the resume fast-path. The actual
-                // warpify UI activation is driven by the synthesized
-                // InitShell + Bootstrapped flow emitted from
-                // `TerminalModel::resume_warpify_session`; nothing further
-                // needs to be dispatched view-side. See isidore-infra#560.
-                send_telemetry_from_ctx!(TelemetryEvent::ResumeWarpifySession, ctx);
-                return;
+            Event::ResumeWarpifySession(resume_warpify_session_event) => {
+                ModelEvent::ResumeWarpifySession(resume_warpify_session_event)
             }
             Event::InitSsh(init_ssh_event) => ModelEvent::InitSsh(init_ssh_event),
             Event::PromptUpdated => ModelEvent::PromptUpdated,
@@ -451,6 +445,12 @@ pub enum ModelEvent {
     InitSubshell(InitSubshellEvent),
     /// Emitted when the user's RC file has been executed in a subshell.
     SourcedRcFileInSubshell(SourcedRcFileInSubshellEvent),
+    /// Emitted when a tab attaches to an already-warpified backing shell
+    /// via the ResumeWarpifySession DCS hook (e.g. `dtach -A` to a
+    /// pre-existing socket). The view activates warpify UI for this tab
+    /// without injecting a subshell bootstrap into the shared inner shell.
+    /// See isidore-infra#560.
+    ResumeWarpifySession(ResumeWarpifySessionEvent),
     InitSsh(InitSshEvent),
     /// Emitted when the active block's prompt has been updated.
     PromptUpdated,
