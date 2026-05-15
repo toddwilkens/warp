@@ -4,7 +4,7 @@ use crate::terminal::available_shells::AvailableShell;
 use crate::terminal::block_list_element::GridType;
 use crate::terminal::event::{
     BootstrappedEvent, Event, ExecutedExecutorCommandEvent, InitSshEvent, InitSubshellEvent,
-    ResumeWarpifySessionEvent, SourcedRcFileInSubshellEvent, SshLoginStatus, TerminalMode,
+    SourcedRcFileInSubshellEvent, SshLoginStatus, TerminalMode,
 };
 use crate::terminal::event_listener::ChannelEventListener;
 use crate::terminal::model::ansi;
@@ -82,6 +82,7 @@ use std::ops::{Range, RangeInclusive};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use warp_core::features::FeatureFlag;
 use warp_core::semantic_selection::SemanticSelection;
 pub use warp_terminal::model::BlockIndex;
@@ -3025,16 +3026,18 @@ impl ansi::Handler for TerminalModel {
 
     fn resume_warpify_session(&mut self, data: ResumeWarpifySessionValue) {
         // Fast path for tabs attaching to an already-warpified backing shell
-        // (e.g. `dtach -A` to a pre-existing socket). Caller has an out-of-band
-        // guarantee the shared inner shell is already bootstrapped, so we
-        // activate warpify UI for this tab WITHOUT injecting a re-bootstrap
-        // script into the inner shell. See isidore-infra#560.
+        // (e.g. `dtach -A` to a pre-existing socket). The shared inner shell
+        // is already bootstrapped on the wire, so we activate warpify UI for
+        // this tab WITHOUT writing anything to the PTY (which would broadcast
+        // through dtach to every other attached client). See isidore-infra#560.
         //
-        // Diverges from `sourced_rc_file` in two ways:
-        //   1. Does NOT touch `did_receive_rc_file_dcs` — there is no RC-file
-        //      flow to coalesce with on the resume path.
-        //   2. Mirrors `init_shell`'s `ignore_bootstrapping_messages` guard so
-        //      shutdown/exit paths cannot accidentally re-warpify a dying tab.
+        // Mechanism: synthesize the `InitShell` + `Bootstrapped` model calls
+        // locally that the remote shell would normally emit during a fresh
+        // subshell bootstrap. Every downstream side effect (subshell session
+        // registration, `SessionBootstrapped` view activation, block boundary
+        // reinit, history wiring, telemetry) rides on the existing
+        // `HandlerEvent::InitShell` / `HandlerEvent::Bootstrapped` plumbing —
+        // we just enter it without a PTY round-trip.
         if self.ignore_bootstrapping_messages {
             return;
         }
@@ -3048,22 +3051,50 @@ impl ansi::Handler for TerminalModel {
             );
             return;
         }
-        let shell_type = ShellType::from_name(data.shell.as_str());
-        match shell_type {
-            Some(shell_type) => self.event_proxy.send_terminal_event(
-                Event::ResumeWarpifySession(ResumeWarpifySessionEvent {
-                    shell_type,
-                    uname: data.uname,
-                    session_id: data.session_id,
-                }),
-            ),
-            None => {
-                log::error!(
-                    "Received invalid shell name in ResumeWarpifySessionValue: {}",
-                    data.shell
-                );
-            }
+        if ShellType::from_name(data.shell.as_str()).is_none() {
+            log::error!(
+                "Received invalid shell name in ResumeWarpifySessionValue: {}",
+                data.shell
+            );
+            return;
         }
+
+        // Per-tab session_id with nanosecond entropy. The remote shell's real
+        // session_id is owned by Tab A's view of the subshell; Tab B builds
+        // an independent client-side session over the same backing PTY chain
+        // (autossh → ssh → dtach → shared inner zsh). Nanos avoid collision
+        // with Tab B's local Mac-shell SessionId (which is a `date +%s$RANDOM`
+        // value emitted by `WARP_SESSION_ID`).
+        let synthetic_session_id: u64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or_default();
+        let uname = data.uname.unwrap_or_default();
+        let shell_name = data.shell;
+
+        self.init_shell(InitShellValue {
+            session_id: synthetic_session_id.into(),
+            shell: shell_name.clone(),
+            is_subshell: true,
+            user: String::new(),
+            // Empty hostname forces `determine_session_type` → `WarpifiedRemote`
+            // (the local-hostname compare in session.rs:675 fails), which is
+            // the correct classification: we're warpifying a remote inner shell.
+            hostname: String::new(),
+            wsl_name: None,
+        });
+        self.bootstrapped(BootstrappedValue {
+            shell: shell_name,
+            os_category: Some(uname),
+            ..Default::default()
+        });
+
+        // Telemetry marker for the resume fast-path. `BootstrappingSucceeded`
+        // also fires from `Sessions::initialize_bootstrapped_session` and
+        // covers the underlying bootstrap dimensions; this marker is
+        // specifically "we took the no-PTY-write resume path".
+        self.event_proxy
+            .send_terminal_event(Event::ResumeWarpifySession);
     }
 
     fn init_ssh(&mut self, data: InitSshValue) {
