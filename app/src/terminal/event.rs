@@ -92,12 +92,13 @@ pub enum Event {
     InitSubshell(InitSubshellEvent),
     /// Emitted when the user's RC file has been executed in a subshell.
     SourcedRcFileInSubshell(SourcedRcFileInSubshellEvent),
-    /// Emitted when a tab attaches to an already-warpified backing shell
-    /// via the ResumeWarpifySession DCS hook (e.g. `dtach -A` to a
-    /// pre-existing socket). The view-side handler activates warpify UI
-    /// for this tab WITHOUT injecting a subshell bootstrap into the
-    /// (shared, already-running) inner shell. See isidore-infra#560.
-    ResumeWarpifySession(ResumeWarpifySessionEvent),
+    /// Telemetry marker emitted after the resume fast-path completes
+    /// (`TerminalModel::resume_warpify_session`). The actual warpify UI
+    /// activation rides on the synthesized `InitShell`+`Bootstrapped`
+    /// flow; this unit variant exists purely so the model-events
+    /// dispatcher can distinguish "fast-path resume" from a real subshell
+    /// bootstrap when firing telemetry. See isidore-infra#560.
+    ResumeWarpifySession,
     /// Emitted when the active block's prompt has been updated.
     PromptUpdated,
     /// Emitted when the honor_ps1 state of the shell is out-of-sync with Warp's settings.
@@ -168,18 +169,6 @@ pub struct SourcedRcFileInSubshellEvent {
     pub shell_type: ShellType,
     pub uname: Option<String>,
     pub tmux: Option<bool>,
-}
-
-/// Emitted on the fast-path warpify hook for tabs attaching to an
-/// already-bootstrapped backing shell. Carries the minimum info the
-/// view needs to mark warpify UI active for this tab; `session_id`
-/// is opaque to Warp and used only for log/telemetry correlation
-/// across the N tabs sharing the same backing shell.
-#[derive(Debug, Clone)]
-pub struct ResumeWarpifySessionEvent {
-    pub shell_type: ShellType,
-    pub uname: Option<String>,
-    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -469,9 +458,7 @@ impl Debug for Event {
             Event::SourcedRcFileInSubshell(event) => {
                 write!(f, "SourcedRcFileInSubshell({event:?})")
             }
-            Event::ResumeWarpifySession(event) => {
-                write!(f, "ResumeWarpifySession({event:?})")
-            }
+            Event::ResumeWarpifySession => write!(f, "ResumeWarpifySession"),
             Event::InitSsh(event) => {
                 write!(f, "InitSsh({event:?})")
             }

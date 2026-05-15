@@ -11781,56 +11781,6 @@ impl TerminalView {
                     },
                 );
             }
-            ModelEvent::ResumeWarpifySession(event) => {
-                // Site 5 (#560): re-attach to an already-warpified shared session
-                // (e.g. dtach -A). Unlike SourcedRcFileInSubshell, the rcfile has
-                // NOT been re-sourced on this attach, so we skip both the bootstrap
-                // delay and trigger_subshell_bootstrap; warpify state on the shell
-                // is already live. We just re-light the UI side via
-                // continue_warpify_ssh_session.
-                send_telemetry_from_ctx!(TelemetryEvent::ResumeWarpifySession, ctx);
-                let shell_type = event.shell_type;
-                let uname = event.uname.clone().unwrap_or_default();
-                log::info!(
-                    "ResumeWarpifySession arm entered: shell_type={:?} uname={:?}",
-                    shell_type,
-                    uname
-                );
-                let (is_ssh, is_tmux_control_mode_active, has_ai_metadata) = {
-                    let lock = self.model.lock();
-                    let has_ai_metadata = lock
-                        .block_list()
-                        .active_block()
-                        .agent_interaction_metadata()
-                        .is_some();
-                    (
-                        lock.is_ssh_block(),
-                        lock.tmux_control_mode_active(),
-                        has_ai_metadata,
-                    )
-                };
-                log::info!(
-                    "ResumeWarpifySession guards: is_ssh={} tmux_control_mode_active={} has_ai_metadata={}",
-                    is_ssh,
-                    is_tmux_control_mode_active,
-                    has_ai_metadata
-                );
-                if has_ai_metadata || is_tmux_control_mode_active {
-                    log::info!(
-                        "ResumeWarpifySession early-return: ai_metadata={} tmux={}",
-                        has_ai_metadata,
-                        is_tmux_control_mode_active
-                    );
-                    return;
-                }
-                if is_ssh {
-                    log::info!("ResumeWarpifySession: calling continue_warpify_ssh_session");
-                    self.continue_warpify_ssh_session(&uname, shell_type, ctx);
-                    log::info!("ResumeWarpifySession: continue_warpify_ssh_session returned");
-                } else {
-                    log::info!("ResumeWarpifySession: is_ssh=false, no-op");
-                }
-            }
             ModelEvent::PromptUpdated => {
                 self.input.update(ctx, |input, ctx| {
                     input.notify_and_notify_children(ctx);
