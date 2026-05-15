@@ -255,3 +255,62 @@ Add `TelemetryEvent::ResumeWarpifySession` as a sibling unit variant + 5 paralle
 - `app/src/terminal/model/ansi/mod_tests.rs` — JSON round-trip for `ResumeWarpifySession` (mirror existing hook round-trip tests).
 - Mock handler — already covered by the default no-op landed in `:296`.
 - Integration test in `crates/integration/` — exercise the fast path on a tab whose local `block_list` is already bootstrapped.
+
+---
+
+## Phase B validation results (2026-05-15)
+
+**Setup:** `./script/run --release` on Mac (M-series). HEAD `28dd333` (sites 1–6 + diagnostic logs). Two tabs in WarpOss, both `ssh isidore claude-session warpify-attach-test`. Tab A first attach = warpified. Tab B reattach = DCS dispatched, **UI did not warpify**.
+
+### Diagnostic log output (the `log::info!` lines added at every guard + branch in site 5)
+
+```
+[INFO] Received ResumeWarpifySession hook
+[INFO] ResumeWarpifySession arm entered: shell_type=Zsh uname="Linux"
+[INFO] ResumeWarpifySession guards: is_ssh=false tmux_control_mode_active=false has_ai_metadata=false
+[INFO] ResumeWarpifySession: is_ssh=false, no-op
+```
+
+### Finding 1 — `is_ssh` guard is timing-sensitive and false on reattach
+
+`is_ssh_block()` (terminal_model.rs:2329) returns true only while `notify_on_end_of_ssh_login.is_some()`. That flag is set when Warp starts monitoring for the SSH `Last login:` marker and cleared on login complete. On Tab B our DCS lands **before** dtach attaches, before any zsh output, before Warp's SSH-prompt detection fires. Hence `is_ssh=false`.
+
+Tab A works because its DCS (`SourcedRcFileForWarp` from the rcfile bootstrap) fires **after** zsh has rendered the prompt and Warp has detected the SSH login window.
+
+### Finding 2 — Relaxing the `is_ssh` guard is necessary but insufficient
+
+Even if we drop the guard, `continue_warpify_ssh_session` (view.rs:24355) writes the warpify-init script to Tab B's PTY via `clear_line_editor_and_write_to_pty_with_mac_workaround_hack`. Those bytes route through:
+
+```
+Tab B Warp → local zsh → ssh → remote sshd → dtach stdin → shared zsh (broadcast to all attached clients)
+```
+
+So the warpify-init bytes (and the resulting rcfile-source bytes + a fresh `SourcedRcFileForWarp` echo) would appear in **both** Tab A and Tab B — the exact byte-interleave failure mode the NIGHT handoff flagged for `trigger_subshell_bootstrap`. Same disease, different function.
+
+### Finding 3 — Proper fix path is "synthesize InitShell view side effects, no PTY write"
+
+The Tab A normal flow is:
+
+1. Shell sources rcfile → emits `Auto-Warpify` OSC.
+2. Warp writes init script to PTY (**PTY write — broadcasts through dtach**).
+3. Shell sources init script → emits `InitShell` DCS.
+4. `terminal_model::init_shell` builds `pending_session_info` → fires `HandlerEvent::InitShell`.
+5. View receives `HandlerEvent::InitShell` → activates warpify UI (file tree, AI hints, OSC52, command blocks).
+
+The resume flow needs to skip steps 2–3 and synthesize step 5 directly using values shipped in `ResumeWarpifySessionValue` (currently `shell` + `uname`; may need `pwd`, env_var_collection_name, or other fields that `SubshellInitializationInfo` normally collects from the bootstrap).
+
+**Open implementation questions:**
+
+1. What does `HandlerEvent::InitShell` actually do view-side beyond creating `SessionInfo`? Which calls light up which UI features?
+2. Is there a single `set_warpified_for_active_block()`-style entrypoint, or is the warpify-UI state scattered across `warpify_state`, `block_list`, and `sessions`?
+3. Does `SubshellInitializationInfo` require fields we cannot reasonably ship in the DCS (e.g. dynamic shell state computed during bootstrap)?
+
+### Status
+
+- Caller (`isidore-infra/installers/dtach.sh`) DCS emission verified working end-to-end (DCS reaches Warp, is parsed, dispatched as `ModelEvent::ResumeWarpifySession`).
+- Sites 1, 2, 3, 4, 4b, 6 (mechanical scaffolding + telemetry) all correct.
+- Site 5 (view arm) **needs rework** along the lines of Finding 3 above. Current implementation is a no-op on reattach due to Finding 1, and would be byte-interleave-broken if the guard were relaxed (Finding 2).
+
+### Approach C (planned next — quick empirical probe)
+
+Try replacing the `ResumeWarpifySession` DCS in `claude-session` with a synthetic `SourcedRcFileForWarp` DCS on reattach. Routes through the existing handler. Almost certainly hits the same PTY-write byte-interleave problem (the existing `SourcedRcFileInSubshell` arm calls either `continue_warpify_ssh_session` or `trigger_subshell_bootstrap` after a spawn-delay), but the empirical confirm is cheap and rules out "did we just pick the wrong DCS." No Warp patch needed for this probe.
